@@ -14,7 +14,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 
 const PORT = Number(process.env.OPENCODE_CHROME_PORT || 8766);
 const CFG_DIR = path.join(os.homedir(), ".opencode-chrome");
@@ -49,18 +49,60 @@ const driverSocks = new Set();
 let reqSeq = 0;
 const pending = new Map(); // id -> {resolve, reject, timer}
 
+// Fork change: when another bridge already owns the port (a second Claude session),
+// this process becomes a "driver" of that bridge instead of crashing with EADDRINUSE.
+let upstream = null; // authenticated driver socket to the bridge that owns the port
+
 function askExtension(cmd, params = {}, timeoutMs = 45000) {
   return new Promise((resolve, reject) => {
-    if (!extSock || extSock.readyState !== 1) {
+    const target = upstream || extSock;
+    if (!target || target.readyState !== 1) {
       return reject(new Error("Chrome extension is not connected. Open Chrome and make sure the OpenCode in Chrome extension is enabled and configured."));
     }
-    const id = "b" + (++reqSeq);
+    const id = "b" + process.pid + "-" + (++reqSeq);
     const timer = setTimeout(() => {
       pending.delete(id);
       reject(new Error(`extension timeout after ${timeoutMs}ms on ${cmd}`));
     }, timeoutMs);
     pending.set(id, { resolve, reject, timer });
-    extSock.send(JSON.stringify({ type: "req", id, cmd, params }));
+    target.send(JSON.stringify({ type: "req", id, cmd, params }));
+  });
+}
+
+function rejectAllPending(reason) {
+  for (const [, p] of pending) {
+    clearTimeout(p.timer);
+    p.reject(new Error(reason));
+  }
+  pending.clear();
+}
+
+function connectAsDriver() {
+  const ws = new WebSocket(`ws://127.0.0.1:${PORT}`);
+  ws.on("open", () => ws.send(JSON.stringify({ type: "hello", role: "driver", token: TOKEN })));
+  ws.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    if (msg.type === "hello_ok") {
+      upstream = ws;
+      console.error(`[bridge] port ${PORT} is owned by another bridge; relaying through it`);
+    } else if (msg.type === "res") {
+      const p = pending.get(msg.id);
+      if (!p) return;
+      clearTimeout(p.timer);
+      pending.delete(msg.id);
+      if (msg.ok) p.resolve(msg.data);
+      else p.reject(new Error(msg.error || "extension error"));
+    }
+  });
+  ws.on("error", () => {});
+  ws.on("close", () => {
+    if (upstream === ws) {
+      upstream = null;
+      rejectAllPending("extension disconnected");
+    }
+    // The owning bridge went away: try to take the port over, else re-attach as a driver.
+    setTimeout(listen, 1000);
   });
 }
 
@@ -170,11 +212,22 @@ wss.on("connection", (sock, req) => {
   });
 });
 
-server.listen(PORT, "127.0.0.1", () => {
+function onListenError(e) {
+  if (e.code !== "EADDRINUSE") throw e;
+  connectAsDriver();
+}
+server.on("error", onListenError);
+wss.on("error", onListenError);
+
+function listen() {
+  server.listen(PORT, "127.0.0.1");
+}
+server.on("listening", () => {
   console.error(`[bridge] listening on ws://127.0.0.1:${PORT}`);
   console.error(`[bridge] token: ${TOKEN}   (also saved to ${TOKEN_FILE})`);
   console.error(`[bridge] waiting for the Chrome extension to connect...`);
 });
+listen();
 
 // ---------- MCP server over stdio ----------
 let buf = "";
