@@ -34,6 +34,15 @@ function loadToken() {
 
 const TOKEN = loadToken();
 
+// Fork change: hand the token to the unpacked extension through its own folder,
+// so nobody has to paste it into the options page. The file is gitignored.
+const EXT_TOKEN_FILE = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "extension", "bridge-token.json");
+try {
+  fs.writeFileSync(EXT_TOKEN_FILE, JSON.stringify({ token: TOKEN }));
+} catch (e) {
+  console.error(`[bridge] could not write ${EXT_TOKEN_FILE}: ${e.message}`);
+}
+
 // ---------- extension connection state ----------
 let extSock = null; // currently connected, authenticated extension socket
 const driverSocks = new Set();

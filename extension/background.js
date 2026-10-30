@@ -17,6 +17,13 @@ async function loadConfig() {
   const cfg = await chrome.storage.sync.get(["wsUrl", "token"]);
   wsUrl = (cfg.wsUrl || DEFAULT_WS_URL).trim();
   token = (cfg.token || "").trim();
+  if (!token) {
+    // Fork change: fall back to the token the bridge drops into this extension's folder.
+    try {
+      const res = await fetch(chrome.runtime.getURL("bridge-token.json"), { cache: "no-store" });
+      token = ((await res.json()).token || "").trim();
+    } catch (e) {}
+  }
 }
 
 function setStatus(s) {
